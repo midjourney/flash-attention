@@ -1,6 +1,9 @@
 # Manage Ahead-of-Time (AOT) compiled kernels
+import atexit
+import contextlib
 import fcntl
 import hashlib
+import logging
 import os
 import pickle
 import sys
@@ -37,6 +40,11 @@ CUTE_DSL_CACHE_ENABLED: bool = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED
 # Customize cache dir via `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`, default is
 # `/tmp/${USER}/flash_attention_cute_dsl_cache``
 CUTE_DSL_CACHE_DIR: str | None = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_DIR", None)
+
+
+# Share compiled kernels across machines with Redis as an L2 behind the disk cache via
+# `FLASH_ATTENTION_CUTE_DSL_CACHE_REDIS_URL=redis://...` (needs the cache enabled)
+CUTE_DSL_CACHE_REDIS_URL: str | None = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_REDIS_URL", None)
 
 
 def get_cache_path() -> Path:
@@ -290,6 +298,200 @@ class JITPersistentCache(JITCache):
             child.unlink()
 
 
+class _StderrUnlessConfigured(logging.Handler):
+    """Prints to stderr only when no other non-Null handler the record propagates to exists: the
+    NullHandler fa_logging puts on `flash_attn` otherwise hides it (it disables lastResort)."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        logger = logging.getLogger(record.name)
+        while logger is not None:
+            if any(
+                h is not self and not isinstance(h, logging.NullHandler) for h in logger.handlers
+            ):
+                return
+            logger = logger.parent if logger.propagate else None
+        try:  # sys.stderr looked up per record, like lastResort, so a later redirect is followed
+            sys.stderr.write(self.format(record) + "\n")
+        except Exception:
+            self.handleError(record)
+
+
+_redis_log = logging.getLogger("flash_attn.redis_cache")
+
+
+class RedisL2:
+    """Redis client for RedisJITPersistentCache, shared by every cache in the process.
+
+    `redis` is imported on first use. The first failure (missing package, connect, timeout,
+    auth, unreadable compile target) logs one warning and turns Redis off for the rest of the
+    process, so the cache falls back to compiling and a Redis outage never fails the caller.
+    """
+
+    # Entries expire so stale fingerprints and any bad entry age out without an operator
+    TTL_SECONDS = 14 * 24 * 3600
+
+    def __init__(self, url: str):
+        self._url = url
+        self._client = None
+        self._disabled = False
+        self._fetch_failure_warned = False
+        self.hits = self.misses = self.uploads = 0
+
+    def get(self, namespace: str, sha256_hex: str) -> bytes | None:
+        blob = self._call("get", namespace, sha256_hex)
+        if not self._disabled:  # a failed or skipped GET is neither a hit nor a miss
+            if blob is None:
+                self.misses += 1
+            else:
+                self.hits += 1
+        return blob
+
+    def put(self, namespace: str, sha256_hex: str, value: bytes, replace: bool) -> None:
+        if self._call("set", namespace, sha256_hex, value, nx=not replace, ex=self.TTL_SECONDS):
+            self.uploads += 1
+
+    def log_summary(self) -> None:
+        _redis_log.info(
+            "FA4 Redis compile cache: %d hits, %d misses, %d uploads%s",
+            self.hits,
+            self.misses,
+            self.uploads,
+            " (disabled after an error)" if self._disabled else "",
+        )
+
+    def report_fetch_failure(self, e: Exception) -> None:
+        """A fetched entry that cannot reach the disk cache is compiled locally: warn once."""
+        message = f"Writing a Redis entry to the disk cache failed ({type(e).__name__}: {e})"
+        if self._fetch_failure_warned:
+            fa_log(1, message)
+            return
+        self._fetch_failure_warned = True
+        _redis_log.warning("FA4 Redis compile cache: %s; compiling locally", message)
+
+    def _call(self, method: str, namespace: str, sha256_hex: str, *args, **kwargs):
+        if self._disabled:
+            return None
+        try:
+            key = _redis_key(namespace, sha256_hex)
+            if self._client is None:
+                import redis
+
+                # Bounded by default; timeouts in the URL's query string take precedence
+                self._client = redis.Redis.from_url(
+                    self._url, socket_connect_timeout=2, socket_timeout=3
+                )
+            return getattr(self._client, method)(key, *args, **kwargs)
+        except Exception as e:
+            self._disabled = True
+            # Only the exception type: the URL, which may surface in messages, carries the password
+            _redis_log.warning(
+                "FA4 Redis compile cache disabled for this process (%s on %s); compiling locally",
+                type(e).__name__,
+                method,
+            )
+            return None
+
+
+def _start_redis_l2(url: str) -> RedisL2:
+    # At INFO so the on/summary lines show whatever the FA level, with or without app logging
+    _redis_log.setLevel(logging.INFO)
+    _redis_log.addHandler(_StderrUnlessConfigured())
+    redis_l2 = RedisL2(url)
+    _redis_log.info("FA4 Redis compile cache on (L2 behind the disk cache)")
+    atexit.register(redis_l2.log_summary)
+    return redis_l2
+
+
+_REDIS_L2: RedisL2 | None = (
+    _start_redis_l2(CUTE_DSL_CACHE_REDIS_URL)
+    if CUTE_DSL_CACHE_ENABLED and CUTE_DSL_CACHE_REDIS_URL
+    else None
+)
+
+
+@lru_cache(maxsize=1)
+def _compile_target() -> str:
+    """GPU arch and CUDA toolkit the objects are built for. Part of the Redis key, which machines
+    share; resolved on first use, when the process already runs on its GPU."""
+    from cutlass.base_dsl import detect_gpu_arch
+
+    arch = os.getenv("CUTE_DSL_ARCH") or detect_gpu_arch("")
+    return f"{arch}-cu{cutlass.CUDA_VERSION.major}.{cutlass.CUDA_VERSION.minor}"
+
+
+def _redis_key(namespace: str, sha256_hex: str) -> str:
+    return f"{namespace}:{_compile_target()}:{sha256_hex}"
+
+
+class RedisJITPersistentCache(JITPersistentCache):
+    """
+    JITPersistentCache with Redis as L2: a disk miss fetches the exported object from Redis
+    into the disk cache, then loads it as a disk hit; each new export is uploaded.
+    Keys are namespaced like the disk path (source fingerprint + cache name) plus the compile
+    target, so machines with another GPU arch or CUDA toolkit never share an entry.
+    """
+
+    def __init__(self, cache_path: Path, redis_l2: RedisL2, key_prefix: str):
+        super().__init__(cache_path)
+        self.redis_l2: RedisL2 = redis_l2
+        self.key_prefix: str = key_prefix
+
+    def _try_load_from_storage(self, key: CompileKeyType) -> bool:
+        if super()._try_load_from_storage(key):
+            return True
+        if not self._fetch_from_redis(self._key_to_hash(key)):
+            return False
+        return super()._try_load_from_storage(key)
+
+    def _try_export_to_storage(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
+        sha256_hex = self._key_to_hash(key)
+        # An entry this process could not load may have come from Redis: replace it there too
+        replace = sha256_hex in self._unloadable
+        super()._try_export_to_storage(key, fn)
+        try:
+            if not self._has_loadable_candidate(sha256_hex):
+                return  # the export failed: nothing on disk, or still the entry that failed to load
+            blob = (self.cache_path / f"{sha256_hex}.o").read_bytes()
+            self.redis_l2.put(self.key_prefix, sha256_hex, blob, replace=replace)
+        except OSError as e:  # the disk entry vanished: the function is already cached in memory
+            fa_log(1, f"Reading the exported entry for upload failed ({type(e).__name__}: {e})")
+
+    def _fetch_from_redis(self, sha256_hex: str) -> bool:
+        """Copy an entry from Redis into the disk cache; any reply, lock or disk error is a miss.
+        The GET runs outside the entry's lock: a slow Redis must not hold the lock that upstream's
+        load and export wait on (their lock timeouts raise)."""
+        obj_path = self.cache_path / f"{sha256_hex}.o"
+        tmp_path = self.cache_path / f".{sha256_hex}.{os.getpid()}.tmp.o"
+        try:
+            blob = self.redis_l2.get(self.key_prefix, sha256_hex)
+            if blob is None:
+                return False
+            with FileLock(
+                self._lock_path(sha256_hex),
+                exclusive=True,
+                timeout=self.LOCK_TIMEOUT_SECONDS,
+                label=sha256_hex,
+            ):
+                if not self._has_loadable_candidate(sha256_hex):  # else another process wrote it
+                    tmp_path.write_bytes(blob)
+                    os.replace(tmp_path, obj_path)
+        except Exception as e:
+            with contextlib.suppress(OSError):  # cleanup must not raise either
+                tmp_path.unlink(missing_ok=True)
+            self.redis_l2.report_fetch_failure(e)
+            return False
+        fa_log(1, f"Fetched compiled function from Redis for key hash {sha256_hex}")
+        return True
+
+    def _has_loadable_candidate(self, sha256_hex: str) -> bool:
+        """A nonempty disk entry this process has not failed to load: upstream's skip condition
+        in _try_export_to_storage (keep the two in sync on rebase)."""
+        obj_path = self.cache_path / f"{sha256_hex}.o"
+        return (
+            sha256_hex not in self._unloadable and obj_path.exists() and obj_path.stat().st_size > 0
+        )
+
+
 def get_jit_cache(name: str | None = None) -> JITCache:
     """
     JIT cache factory.
@@ -304,6 +506,9 @@ def get_jit_cache(name: str | None = None) -> JITCache:
         if name:
             path = path / name
         fa_log(1, f"Creating persistent JIT cache at {path}")
+        if _REDIS_L2 is not None:
+            key_prefix = f"fa4:{_compute_source_fingerprint()}:{name or ''}"
+            return RedisJITPersistentCache(path, _REDIS_L2, key_prefix)
         return JITPersistentCache(path)
     else:
         fa_log(1, "Persistent cache disabled, using in-memory JIT cache")
