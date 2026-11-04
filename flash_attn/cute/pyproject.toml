@@ -33,6 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.6.2"]
+redis = ["redis>=5"]
 dev = [
     "pytest",
     "pytest-xdist",
